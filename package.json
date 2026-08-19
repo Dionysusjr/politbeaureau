@@ -1,0 +1,35 @@
+{
+  "name": "capitol-ledger",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Live dashboard of US political trading disclosures — stocks, ETFs, bonds, funds, options and crypto disclosed by politicians and executive-branch officials, with per-filer profiles, per-asset history, and portfolio-size rankings.",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "next lint",
+    "typecheck": "tsc --noEmit",
+    "verify:parsers": "tsx --tsconfig tsconfig.json scripts/verify-parsers.ts"
+  },
+  "dependencies": {
+    "cheerio": "^1.0.0",
+    "fflate": "^0.8.2",
+    "next": "^14.2.5",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "swr": "^2.2.5"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.9",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "autoprefixer": "^10.4.19",
+    "postcss": "^8.4.39",
+    "tailwindcss": "^3.4.4",
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.3"
+  },
+  "engines": {
+    "node": ">=18.18"
+  }
+}
