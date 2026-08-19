@@ -14,14 +14,14 @@ The fastest route to a public, shareable link is Vercel — free tier, no config
 files needed:
 
 1. Go to **[vercel.com/new](https://vercel.com/new)**, sign in with GitHub, and
-   import the **`capitol-ledger`** repo (grant access if prompted). Vercel
+   import the **`politbeaureau`** repo (grant access if prompted). Vercel
    detects Next.js automatically — accept every default.
 2. Expand **Environment Variables** and add one:
    `CONTACT_EMAIL` = your email address. The SEC's fair-access policy requires
    requests to identify their sender, and the House/Senate sites behave better
    with one too.
 3. Click **Deploy**. About two minutes later you get a public URL like
-   `https://capitol-ledger-xxxx.vercel.app` — that is the link to share. Anyone
+   `https://politbeaureau-xxxx.vercel.app` — that is the link to share. Anyone
    who opens it sees the page refresh itself every 30 seconds.
 
 Every later push to `main` redeploys automatically; other branches get their own
