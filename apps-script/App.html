@@ -436,7 +436,7 @@ function renderLeaderboard(pols) {
       '<div class="row" style="gap:12px;flex-wrap:nowrap">' +
       '<span class="rank tnum">' + p.rank + '</span>' +
       '<span class="name">' + esc(p.name) + '</span>' +
-      '<span class="row" style="gap:4px;font-size:12px;flex:none">' + partyMark(p.party) +
+      '<span class="row party" style="gap:4px;font-size:12px;flex:none">' + partyMark(p.party) +
       '<span class="muted">' + esc(p.state) + (p.district ? '-' + p.district : '') + '</span></span>' +
       tierBadge(p.tier, true) +
       '<span class="val tnum" title="Estimated ' + usdCompact(p.portfolioValueMin) + ' – ' +

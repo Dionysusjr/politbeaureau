@@ -132,6 +132,9 @@ tbody tr:last-child td { border-bottom: 0; }
                white-space: nowrap; font-weight: 500; }
 .board .val { width: 84px; text-align: right; font-weight: 600; flex: none; }
 .board .cnt { width: 56px; text-align: right; font-size: 12px; color: var(--text-muted); flex: none; }
+.board .party { display: none; }
+@media (min-width: 640px) { .board .party { display: inline-flex; } }
+@media (max-width: 767px) { .board .cnt { display: none; } }
 
 /* Magnitude bars: one shared scale, anchored to a common left baseline. */
 .bar { height: 6px; border-radius: 2px; background: var(--gridline);
@@ -141,6 +144,11 @@ tbody tr:last-child td { border-bottom: 0; }
 .board .bar { margin-left: 40px; }
 
 .grid2 { display: grid; gap: 24px; }
+/* Grid items default to min-width:auto, so a wide child (a nowrap leaderboard
+   row, a table) stretches the track past the viewport and scrolls the whole
+   page sideways on a phone. Letting them shrink is what keeps .scroll's
+   overflow-x:auto doing its job instead of being overridden by content. */
+.grid2 > * { min-width: 0; }
 @media (min-width: 1024px) {
   .grid2 { grid-template-columns: minmax(0,1.1fr) minmax(0,1fr); }
   .grid2.detail { grid-template-columns: minmax(0,1fr) minmax(0,1.4fr); }
@@ -149,7 +157,7 @@ tbody tr:last-child td { border-bottom: 0; }
 /* Filters ----------------------------------------------------------------- */
 .filters { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; }
 .filters input[type=search] {
-  width: 230px; border: 1px solid var(--border); background: transparent;
+  flex: 1 1 180px; max-width: 280px; min-width: 0; border: 1px solid var(--border); background: transparent;
   color: var(--text-primary); border-radius: 8px; padding: 6px 12px;
   font-family: inherit; font-size: 14px;
 }
