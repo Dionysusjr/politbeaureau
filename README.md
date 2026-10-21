@@ -33,6 +33,14 @@ data, and if an upstream source is unavailable the page shows an honest
 "LIVE MODE — AWAITING DATA" state with per-source diagnostics rather than
 inventing filers.
 
+## Prefer Google Apps Script?
+
+There is a complete rewrite of this dashboard in **[`apps-script/`](apps-script/)**
+that runs entirely inside Google Apps Script and publishes as a Web App — no
+Node, no npm, no hosting account. Same views, same tier colours, same data
+sources. See [`apps-script/README.md`](apps-script/README.md) for the
+step-by-step deployment.
+
 ## Views
 
 - **Dashboard** (`/`) — headline stats, a portfolio-size leaderboard, the

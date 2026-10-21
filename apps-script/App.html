@@ -1,0 +1,991 @@
+<script>
+/*
+ * Client app. Vanilla JS on purpose: an Apps Script HtmlService page has no
+ * bundler, and the page is served inside a sandboxed iframe on a different
+ * origin from script.google.com — so a plain fetch() back to the web app URL is
+ * blocked by CORS. google.script.run is the supported bridge, so all server
+ * calls go through it.
+ */
+
+var TIER_STYLE = {
+  mega:   { mark: '#af913c', text: '#e0c063', label: 'MEGA',   short: 'MEGA',  desc: '$5M+ estimated portfolio' },
+  large:  { mark: '#008300', text: '#4ac97a', label: 'LARGE',  short: 'LARGE', desc: '$1M – $5M estimated portfolio' },
+  medium: { mark: '#3987e5', text: '#8fc0f7', label: 'MEDIUM', short: 'MED',   desc: '$250K – $1M estimated portfolio' },
+  small:  { mark: '#e12323', text: '#ff8a8a', label: 'SMALL',  short: 'SMALL', desc: 'Under $250K estimated portfolio' }
+};
+var TIER_ORDER = ['mega', 'large', 'medium', 'small'];
+
+var PARTY_STYLE = {
+  D: { mark: '#3987e5', text: '#8fc0f7', label: 'Democrat' },
+  R: { mark: '#e12323', text: '#ff8a8a', label: 'Republican' },
+  I: { mark: '#af913c', text: '#e0c063', label: 'Independent' },
+  unknown: { mark: '#7c8798', text: '#aab2c0', label: 'Not disclosed' }
+};
+
+var ASSET_CLASS_LABEL = {
+  stock: 'Stock', etf: 'ETF', mutual_fund: 'Mutual fund', corporate_bond: 'Corporate bond',
+  municipal_bond: 'Municipal bond', treasury: 'Treasury', option: 'Option',
+  crypto: 'Crypto', reit: 'REIT', ipo: 'IPO', other: 'Other'
+};
+var TRADE_TYPE_LABEL = {
+  purchase: 'Purchase', sale: 'Sale', partial_sale: 'Partial sale', exchange: 'Exchange'
+};
+var OWNER_LABEL = {
+  self: 'Self', spouse: 'Spouse', joint: 'Joint', dependent: 'Dependent', unknown: '—'
+};
+
+var state = {
+  snapshot: null,
+  view: INITIAL_VIEW,
+  id: INITIAL_ID,
+  detail: null,
+  loadingDetail: false,
+  error: null,
+  filters: { search: '', chamber: 'all', party: 'all', tier: 'all' },
+  seenTradeIds: null,
+  freshTradeIds: {},
+  sourcesOpen: false
+};
+
+/* ---------------------------------------------------------------- helpers */
+
+function esc(value) {
+  return String(value === null || value === undefined ? '' : value)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function usdCompact(value) {
+  var abs = Math.abs(value), sign = value < 0 ? '-' : '';
+  if (abs >= 1e9) return sign + '$' + (abs / 1e9).toFixed(abs >= 1e10 ? 0 : 1) + 'B';
+  if (abs >= 1e6) return sign + '$' + (abs / 1e6).toFixed(abs >= 1e7 ? 0 : 1) + 'M';
+  if (abs >= 1e3) return sign + '$' + (abs / 1e3).toFixed(abs >= 1e4 ? 0 : 1) + 'K';
+  return sign + '$' + abs.toFixed(0);
+}
+
+function relativeTime(iso) {
+  var then = Date.parse(iso);
+  if (!isFinite(then)) return '—';
+  var diff = Math.round((Date.now() - then) / 1000);
+  if (diff < 5) return 'just now';
+  if (diff < 60) return diff + 's ago';
+  var m = Math.round(diff / 60);
+  if (m < 60) return m + 'm ago';
+  var h = Math.round(m / 60);
+  if (h < 24) return h + 'h ago';
+  return Math.round(h / 24) + 'd ago';
+}
+
+function isBuy(t) { return t.type === 'purchase' || t.type === 'exchange'; }
+
+/** Tier badge — the tier NAME always rides with the colour, never colour alone. */
+function tierBadge(tier, small) {
+  var s = TIER_STYLE[tier] || TIER_STYLE.small;
+  return '<span class="badge' + (small ? ' sm' : '') + '" title="' + esc(s.desc) + '" style="color:' +
+    s.text + ';border-color:' + s.mark + '80;background:' + s.mark + '1f">' +
+    '<span class="dot' + (small ? ' sm' : '') + '" style="background:' + s.mark + '"></span>' +
+    (small ? s.short : s.label) + '</span>';
+}
+
+function partyMark(party) {
+  var p = PARTY_STYLE[party] || PARTY_STYLE.unknown;
+  return '<span class="dot sm" style="background:' + p.mark + '"></span>' +
+    '<span style="color:' + p.text + '">' + (party === 'unknown' ? '—' : esc(party)) + '</span>';
+}
+
+function tile(label, value, sub, delta) {
+  var html = '<div class="tile"><div class="label">' + esc(label) + '</div>' +
+    '<div class="value' + (String(value).length > 9 ? ' long' : '') + '">' + esc(value) + '</div>';
+  var bits = [];
+  if (delta) {
+    bits.push('<span style="color:' + (delta.dir === 'up' ? 'var(--buy-text)' : 'var(--sell-text)') +
+      '">' + (delta.dir === 'up' ? '▲' : '▼') + ' ' + esc(delta.text) + '</span>');
+  }
+  if (sub) bits.push('<span>' + esc(sub) + '</span>');
+  if (bits.length) html += '<div class="sub">' + bits.join(' ') + '</div>';
+  return html + '</div>';
+}
+
+function bar(widthPct, color, thin) {
+  return '<div class="bar' + (thin ? ' thin' : '') + '"><span style="width:' +
+    Math.max(0, Math.min(100, widthPct)) + '%;background:' + color + '"></span></div>';
+}
+
+/* ------------------------------------------------------------ server calls */
+
+function callServer(fnName, arg) {
+  return new Promise(function (resolve, reject) {
+    var runner = google.script.run
+      .withSuccessHandler(resolve)
+      .withFailureHandler(function (err) { reject(err); });
+    if (arg === undefined) runner[fnName]();
+    else runner[fnName](arg);
+  });
+}
+
+function loadSnapshot() {
+  return callServer('getSnapshotForClient').then(function (snap) {
+    markFreshTrades(snap);
+    state.snapshot = snap;
+    state.error = null;
+    render();
+  }).catch(function (err) {
+    state.error = (err && err.message) || String(err);
+    render();
+  });
+}
+
+/**
+ * Flag rows that arrived since the last poll so the tape can flash them. The
+ * first load primes the set instead of flashing everything at once.
+ */
+function markFreshTrades(snap) {
+  var incoming = (snap.recentTrades || []).map(function (t) { return t.id; });
+  if (state.seenTradeIds === null) {
+    state.seenTradeIds = {};
+    for (var i = 0; i < incoming.length; i++) state.seenTradeIds[incoming[i]] = true;
+    return;
+  }
+  var fresh = {};
+  for (var j = 0; j < incoming.length; j++) {
+    if (!state.seenTradeIds[incoming[j]]) fresh[incoming[j]] = true;
+    state.seenTradeIds[incoming[j]] = true;
+  }
+  state.freshTradeIds = fresh;
+  setTimeout(function () { state.freshTradeIds = {}; }, 1600);
+}
+
+function navigate(view, id) {
+  state.view = view;
+  state.id = id || '';
+  state.detail = null;
+  state.error = null;
+  window.scrollTo(0, 0);
+
+  if (view === 'dashboard') { render(); return; }
+
+  state.loadingDetail = true;
+  render();
+
+  var fn = view === 'politician' ? 'getPoliticianForClient' : 'getAssetForClient';
+  callServer(fn, id).then(function (detail) {
+    state.loadingDetail = false;
+    if (!detail) {
+      state.error = view === 'politician'
+        ? 'No filer found with id "' + id + '"'
+        : 'No disclosed asset found for "' + id + '"';
+    } else {
+      state.detail = detail;
+    }
+    render();
+  }).catch(function (err) {
+    state.loadingDetail = false;
+    state.error = (err && err.message) || String(err);
+    render();
+  });
+}
+
+/* ---------------------------------------------------------------- filters */
+
+function filteredPoliticians() {
+  var all = (state.snapshot && state.snapshot.politicians) || [];
+  var f = state.filters;
+  var q = f.search.trim().toLowerCase();
+  return all.filter(function (p) {
+    if (f.chamber !== 'all' && p.chamber !== f.chamber) return false;
+    if (f.party !== 'all' && p.party !== f.party) return false;
+    if (f.tier !== 'all' && p.tier !== f.tier) return false;
+    if (q && (p.name + ' ' + p.state + ' ' + p.role).toLowerCase().indexOf(q) < 0) return false;
+    return true;
+  });
+}
+
+function filteredAssets() {
+  var all = (state.snapshot && state.snapshot.assets) || [];
+  var q = state.filters.search.trim().toLowerCase();
+  if (!q) return all;
+  return all.filter(function (a) {
+    return ((a.ticker || '') + ' ' + a.name).toLowerCase().indexOf(q) >= 0;
+  });
+}
+
+function filteredTrades(allowedIds) {
+  var all = (state.snapshot && state.snapshot.recentTrades) || [];
+  var f = state.filters;
+  var q = f.search.trim().toLowerCase();
+  var narrowed = f.chamber !== 'all' || f.party !== 'all' || f.tier !== 'all';
+  return all.filter(function (t) {
+    if (narrowed && !allowedIds[t.politicianId]) return false;
+    if (q && (t.politicianName + ' ' + (t.ticker || '') + ' ' + t.assetName)
+        .toLowerCase().indexOf(q) < 0) return false;
+    return true;
+  });
+}
+
+function setFilter(key, value) {
+  state.filters[key] = value;
+  render();
+}
+
+function resetFilters() {
+  state.filters = { search: '', chamber: 'all', party: 'all', tier: 'all' };
+  render();
+}
+
+/* ---------------------------------------------------------------- banner */
+
+function renderBanner(snap) {
+  var live = snap.dataState === 'live';
+  var cold = snap.dataState === 'cold';
+  var label = live ? 'LIVE DISCLOSURES' : (cold ? 'NO SNAPSHOT YET' : 'LIVE MODE — AWAITING DATA');
+  var mark = live ? 'var(--buy-mark)' : '#af913c';
+  var text = live ? 'var(--buy-text)' : '#e0c063';
+
+  var sources = snap.sources || [];
+  var active = sources.filter(function (s) { return s.active; }).length;
+  var failing = sources.filter(function (s) { return !s.ok; }).length;
+
+  var html = '<div class="stack" style="margin-top:12px">';
+  html += '<div class="row" style="font-size:13px">';
+  html += '<span class="badge" style="color:' + text + ';border-color:' + mark +
+    '66;background:' + mark + '1a"><span class="dot pulse" style="background:' + mark +
+    '"></span>' + label + '</span>';
+  html += '<span class="pill" style="cursor:default;color:' +
+    (snap.marketOpen ? 'var(--buy-text)' : 'var(--text-muted)') + '">US market ' +
+    (snap.marketOpen ? 'open' : 'closed') + '</span>';
+  html += '<span class="muted">Updated ' + esc(relativeTime(snap.generatedAt)) + '</span>';
+  html += '<button class="pill' + (state.sourcesOpen ? ' on' : '') +
+    '" onclick="toggleSources()">' + active + ' source' + (active === 1 ? '' : 's') +
+    ' active' + (failing ? ' · ' + failing + ' failing' : '') +
+    (state.sourcesOpen ? ' ▲' : ' ▼') + '</button>';
+  html += '<button class="pill" onclick="refreshNow(this)">Refresh now</button>';
+  html += '</div>';
+
+  if (!live) {
+    html += '<p class="notice warn"><strong>No placeholder data is shown.</strong> ' +
+      'This dashboard is live-only — it has no simulator and no synthetic prices, so when a ' +
+      'source returns nothing the page stays empty rather than inventing filers. ' +
+      'Check the source panel for what each upstream reported.</p>';
+  }
+
+  var warnings = snap.warnings || [];
+  for (var w = 0; w < warnings.length; w++) {
+    html += '<p class="notice bad">' + esc(warnings[w]) + '</p>';
+  }
+
+  if (state.sourcesOpen && sources.length) {
+    html += '<div class="panel scroll" style="padding:0"><table><thead><tr>' +
+      '<th>Source</th><th>State</th><th class="right">Trades</th>' +
+      '<th class="right">Took</th><th>Detail</th></tr></thead><tbody>';
+    for (var i = 0; i < sources.length; i++) {
+      var s = sources[i];
+      var stateText = !s.ok ? '✕ failing' : (s.active ? '● active' :
+        (s.needsCredentials ? '○ needs key' : '○ idle'));
+      var stateColor = !s.ok ? 'var(--sell-text)' :
+        (s.active ? 'var(--buy-text)' : 'var(--text-muted)');
+      html += '<tr><td>' + esc(s.label) + '</td>' +
+        '<td style="color:' + stateColor + '">' + stateText + '</td>' +
+        '<td class="right tnum">' + s.tradeCount + '</td>' +
+        '<td class="right tnum muted">' + (s.ms ? Math.round(s.ms / 100) / 10 + 's' : '—') + '</td>' +
+        '<td class="muted">' + esc(s.message || '—') + '</td></tr>';
+    }
+    html += '</tbody></table></div>';
+  }
+
+  return html + '</div>';
+}
+
+function toggleSources() { state.sourcesOpen = !state.sourcesOpen; render(); }
+
+function refreshNow(btn) {
+  btn.disabled = true;
+  btn.textContent = 'Refreshing…';
+  callServer('refreshNowForClient').then(function (snap) {
+    markFreshTrades(snap);
+    state.snapshot = snap;
+    render();
+  }).catch(function (err) {
+    state.error = (err && err.message) || String(err);
+    render();
+  });
+}
+
+/* -------------------------------------------------------------- dashboard */
+
+function renderDashboard() {
+  var snap = state.snapshot;
+  var pols = filteredPoliticians();
+  var assets = filteredAssets();
+  var allowed = {};
+  for (var i = 0; i < pols.length; i++) allowed[pols[i].id] = true;
+  var trades = filteredTrades(allowed);
+  var stats = snap.stats;
+
+  var html = '<header>';
+  html += '<h1>Capitol Ledger</h1>';
+  html += '<p class="secondary" style="margin-top:4px">What US politicians and ' +
+    'executive-branch officials disclose buying and selling — stocks, ETFs, bonds, funds, ' +
+    'options and crypto — ranked by estimated portfolio size.</p>';
+  html += renderBanner(snap);
+  html += '</header>';
+
+  if (stats) {
+    html += '<section class="tiles">' +
+      tile('Disclosed volume', usdCompact(stats.totalDisclosedValue), 'bracket midpoints') +
+      tile('Buys', usdCompact(stats.buyValue), null, { dir: 'up', text: stats.totalTrades + ' trades' }) +
+      tile('Sells', usdCompact(stats.sellValue), null, { dir: 'down', text: 'disposals' }) +
+      tile('Filers', String(stats.politicianCount), stats.assetCount + ' assets') +
+      tile('New this week', String(stats.newThisWeek), 'by filing date') +
+      tile('Avg filing lag', stats.avgFilingDelayDays + 'd', '45-day limit') +
+      '</section>';
+  }
+
+  html += renderFilters();
+
+  html += '<div class="grid2">';
+  html += '<section class="panel"><div class="spread"><h2>Portfolio leaderboard</h2>' +
+    '<span class="sub">' + pols.length + ' filer' + (pols.length === 1 ? '' : 's') +
+    ' · estimated size</span></div>';
+  html += renderTierLegend(stats && stats.tierCounts);
+  html += renderLeaderboard(pols);
+  html += '</section>';
+
+  html += '<section class="panel"><div class="spread"><h2>Most-traded assets</h2>' +
+    '<span class="sub">by disclosed purchase value</span></div>';
+  html += renderAssetTable(assets);
+  html += '</section>';
+  html += '</div>';
+
+  html += '<section class="panel"><div class="spread"><h2>Latest disclosures</h2>' +
+    '<span class="sub">newest first · refreshes every ' + Math.round(POLL_MS / 1000) +
+    's</span></div>' + renderTape(trades) + '</section>';
+
+  if (snap.recentFilings && snap.recentFilings.length) {
+    html += renderFilings(snap.recentFilings);
+  }
+
+  html += renderFooter();
+  return html;
+}
+
+function renderFilters() {
+  var f = state.filters;
+  var html = '<div class="filters">';
+  html += '<input type="search" placeholder="Search filer, ticker or asset…" value="' +
+    esc(f.search) + '" oninput="setFilter(\'search\', this.value)" ' +
+    'aria-label="Search filers and assets">';
+
+  html += '<span class="sub">Chamber</span>';
+  ['all', 'house', 'senate', 'executive'].forEach(function (c) {
+    var label = c === 'all' ? 'All' : c.charAt(0).toUpperCase() + c.slice(1);
+    html += chip(label, f.chamber === c, "setFilter('chamber','" + c + "')", null);
+  });
+
+  html += '<span class="sub">Party</span>';
+  ['all', 'D', 'R', 'I'].forEach(function (p) {
+    html += chip(p === 'all' ? 'All' : p, f.party === p, "setFilter('party','" + p + "')", null);
+  });
+
+  html += '<span class="sub">Tier</span>';
+  html += chip('All', f.tier === 'all', "setFilter('tier','all')", null);
+  TIER_ORDER.forEach(function (t) {
+    html += chip(TIER_STYLE[t].label, f.tier === t, "setFilter('tier','" + t + "')", TIER_STYLE[t]);
+  });
+
+  if (f.search || f.chamber !== 'all' || f.party !== 'all' || f.tier !== 'all') {
+    html += '<button class="chip" style="border:0;text-decoration:underline" ' +
+      'onclick="resetFilters()">Reset</button>';
+  }
+  return html + '</div>';
+}
+
+function chip(label, active, onclick, tierStyle) {
+  var style = '';
+  if (active && tierStyle) {
+    style = 'border-color:' + tierStyle.mark + ';background:' + tierStyle.mark +
+      '26;color:' + tierStyle.text;
+  } else if (active) {
+    style = 'border-color:var(--series1);background:rgba(57,135,229,0.15);color:var(--text-primary)';
+  }
+  return '<button class="chip" aria-pressed="' + (active ? 'true' : 'false') +
+    '" style="' + style + '" onclick="' + onclick + '">' + esc(label) + '</button>';
+}
+
+function renderTierLegend(counts) {
+  var html = '<div class="row" style="gap:8px 16px;margin:12px 0">';
+  TIER_ORDER.forEach(function (t) {
+    var s = TIER_STYLE[t];
+    html += '<span class="row" style="gap:6px;font-size:12px">' +
+      '<span class="dot" style="border-radius:2px;background:' + s.mark + '"></span>' +
+      '<strong style="color:' + s.text + '">' + s.label + '</strong>' +
+      '<span class="muted">' + esc(s.desc) + '</span>' +
+      (counts ? '<span class="muted tnum">(' + counts[t] + ')</span>' : '') + '</span>';
+  });
+  return html + '</div>';
+}
+
+function renderLeaderboard(pols) {
+  if (!pols.length) return '<p class="muted" style="padding:24px 4px">No filers in this view.</p>';
+  var scaleMax = Math.max.apply(null, pols.map(function (p) { return p.portfolioValue; }).concat([1]));
+
+  var html = '<ol class="board">';
+  pols.slice(0, 30).forEach(function (p) {
+    var s = TIER_STYLE[p.tier] || TIER_STYLE.small;
+    var width = Math.max(1.5, (p.portfolioValue / scaleMax) * 100);
+    html += '<li><div class="entry" onclick="navigate(\'politician\',\'' + esc(p.id) + '\')">' +
+      '<div class="row" style="gap:12px;flex-wrap:nowrap">' +
+      '<span class="rank tnum">' + p.rank + '</span>' +
+      '<span class="name">' + esc(p.name) + '</span>' +
+      '<span class="row" style="gap:4px;font-size:12px;flex:none">' + partyMark(p.party) +
+      '<span class="muted">' + esc(p.state) + (p.district ? '-' + p.district : '') + '</span></span>' +
+      tierBadge(p.tier, true) +
+      '<span class="val tnum" title="Estimated ' + usdCompact(p.portfolioValueMin) + ' – ' +
+      usdCompact(p.portfolioValueMax) + '">' + usdCompact(p.portfolioValue) + '</span>' +
+      '<span class="cnt tnum">' + p.tradeCount + ' trd</span>' +
+      '</div>' + bar(width, s.mark) + '</div></li>';
+  });
+  return html + '</ol>';
+}
+
+function renderAssetTable(assets) {
+  if (!assets.length) return '<p class="muted" style="padding:24px 4px">No assets in this view.</p>';
+  var rows = assets.slice(0, 18);
+  var scaleMax = Math.max.apply(null, rows.map(function (a) { return a.buyValue; }).concat([1]));
+
+  var html = '<div class="scroll"><table><thead><tr><th>Asset</th><th>Class</th>' +
+    '<th class="right">Disclosed buys</th><th class="right">Net flow</th>' +
+    '<th class="right">Filers</th><th>Party mix</th></tr></thead><tbody>';
+
+  rows.forEach(function (a) {
+    var pos = a.netValue >= 0;
+    html += '<tr><td>' +
+      '<span class="link" onclick="navigate(\'asset\',\'' + esc(a.id) + '\')"><strong>' +
+      esc(a.ticker || a.name.slice(0, 34)) + '</strong></span>' +
+      (a.ticker ? '<div class="sub truncate" title="' + esc(a.name) + '">' + esc(a.name) + '</div>' : '') +
+      bar(Math.max(1.5, (a.buyValue / scaleMax) * 100), 'var(--series1)', true) + '</td>' +
+      '<td class="sub nowrap">' + esc(ASSET_CLASS_LABEL[a.assetClass] || a.assetClass) + '</td>' +
+      '<td class="right tnum nowrap">' + usdCompact(a.buyValue) + '</td>' +
+      '<td class="right tnum nowrap" style="color:' + (pos ? 'var(--buy-text)' : 'var(--sell-text)') +
+      '">' + (pos ? '▲' : '▼') + ' ' + usdCompact(Math.abs(a.netValue)) + '</td>' +
+      '<td class="right tnum">' + a.politicianCount + '</td>' +
+      '<td class="nowrap sub">' + partySplit(a.partySplit) + '</td></tr>';
+  });
+  return html + '</tbody></table></div>';
+}
+
+function partySplit(split) {
+  var out = [];
+  ['D', 'R', 'I'].forEach(function (p) {
+    if (split[p] > 0) {
+      out.push('<span class="row" style="gap:4px;display:inline-flex">' +
+        '<span class="dot sm" style="background:' + PARTY_STYLE[p].mark + '"></span>' +
+        '<span class="tnum" style="color:' + PARTY_STYLE[p].text + '">' + p + ' ' + split[p] +
+        '</span></span>');
+    }
+  });
+  return out.length ? out.join(' ') : '<span class="muted">Not disclosed</span>';
+}
+
+function renderTape(trades) {
+  if (!trades.length) return '<p class="muted" style="padding:24px 4px">No disclosures in this view.</p>';
+
+  var html = '<div class="scroll"><table><thead><tr><th>Filer</th><th>Asset</th>' +
+    '<th>Action</th><th class="right">Amount</th><th>Traded</th>' +
+    '<th class="right">Filed after</th></tr></thead><tbody>';
+
+  trades.slice(0, 40).forEach(function (t) {
+    var buy = isBuy(t);
+    var cls = state.freshTradeIds[t.id] ? (buy ? ' class="flash-buy"' : ' class="flash-sell"') : '';
+    var late = t.filingDelayDays > 45;
+    html += '<tr' + cls + '>' +
+      '<td class="truncate"><span class="link" onclick="navigate(\'politician\',\'' +
+      esc(t.politicianId) + '\')">' + esc(t.politicianName) + '</span> ' +
+      '<span class="sub">' + esc(t.state) + '</span></td>' +
+      '<td><span class="link" onclick="navigate(\'asset\',\'' + esc(assetIdOf(t)) + '\')">' +
+      (t.ticker ? esc(t.ticker) : '<em>' + esc(ASSET_CLASS_LABEL[t.assetClass]) + '</em>') +
+      '</span><div class="sub truncate" title="' + esc(t.assetName) + '">' + esc(t.assetName) +
+      '</div></td>' +
+      '<td class="nowrap" style="color:' + (buy ? 'var(--buy-text)' : 'var(--sell-text)') + '">' +
+      (buy ? '▲' : '▼') + ' ' + esc(TRADE_TYPE_LABEL[t.type]) +
+      (t.owner !== 'unknown' && t.owner !== 'self'
+        ? ' <span class="sub">(' + esc(OWNER_LABEL[t.owner]) + ')</span>' : '') + '</td>' +
+      '<td class="right tnum nowrap" title="' + esc(t.amountRange) + '">' +
+      usdCompact(t.amountMin) + '–' + usdCompact(t.amountMax) + '</td>' +
+      '<td class="tnum nowrap secondary">' + esc(t.transactionDate) + '</td>' +
+      '<td class="right tnum nowrap" style="color:' + (late ? 'var(--sell-text)' : 'var(--text-muted)') +
+      '" title="' + (late ? "Beyond the STOCK Act's 45-day reporting window"
+                          : 'Days between transaction and disclosure') + '">' +
+      t.filingDelayDays + 'd</td></tr>';
+  });
+  return html + '</tbody></table></div>';
+}
+
+/** Must agree with assetKey() on the server: ticker, else a slug of the name. */
+function assetIdOf(t) {
+  if (t.ticker) return t.ticker;
+  return 'n-' + String(t.assetName).toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 48);
+}
+
+function renderFilings(filings) {
+  var html = '<section class="panel"><div class="spread"><h2>Filings received</h2>' +
+    '<span class="sub">primary sources · transaction detail may be PDF-only</span></div>' +
+    '<div style="margin-top:12px">';
+  filings.slice(0, 20).forEach(function (f) {
+    html += '<div class="row" style="gap:12px;padding:6px 0;border-bottom:1px solid var(--border)">' +
+      '<span class="muted tnum">' + esc(f.filedDate) + '</span>' +
+      '<span class="link" onclick="navigate(\'politician\',\'' + esc(f.politicianId) + '\')">' +
+      '<strong>' + esc(f.politicianName) + '</strong></span>' +
+      '<span class="secondary">' + esc(f.filingType) + '</span>' +
+      '<span class="sub">' + esc(f.state) + (f.district ? '-' + f.district : '') +
+      ' · ' + esc(f.chamber) + '</span>' +
+      (f.detailInPdfOnly ? '<span class="sub">detail in PDF</span>' : '') +
+      (f.documentUrl ? '<a class="sub" style="color:var(--series1)" target="_blank" ' +
+        'rel="noreferrer noopener" href="' + esc(f.documentUrl) + '">source ↗</a>' : '') +
+      '</div>';
+  });
+  return html + '</div></section>';
+}
+
+function renderFooter() {
+  return '<footer><p>Amounts are <strong>estimates</strong>. US disclosure law requires filers ' +
+    'to report each transaction as a range (e.g. $1,001–$15,000), not an exact figure, so every ' +
+    'dollar value here is derived from bracket midpoints and portfolio sizes are approximations ' +
+    'used for ranking. Filing lag is the gap between transaction and disclosure; the STOCK Act ' +
+    'allows up to 45 days.</p>' +
+    '<p>Nothing here is investment advice, and a disclosed trade is not evidence of wrongdoing. ' +
+    'Verify against the primary filing before drawing conclusions.</p></footer>';
+}
+
+/* --------------------------------------------------------- filer profile */
+
+function renderPolitician(d) {
+  var party = PARTY_STYLE[d.party] || PARTY_STYLE.unknown;
+
+  var html = '<span class="backlink" onclick="navigate(\'dashboard\')">← Back to dashboard</span>';
+  html += '<header><div class="row">' +
+    '<h1>' + esc(d.name) + '</h1>' + tierBadge(d.tier) +
+    '<span class="muted">Rank #' + d.rank + ' by estimated portfolio</span></div>';
+  html += '<div class="row secondary" style="gap:8px 16px;margin-top:8px">' +
+    '<span class="row" style="gap:6px"><span class="dot" style="background:' + party.mark +
+    '"></span><span style="color:' + party.text + '">' + esc(party.label) + '</span></span>' +
+    '<span>' + esc(d.role) + '</span>' +
+    '<span>' + esc(d.state) + (d.district ? ', district ' + d.district : '') + '</span>' +
+    '<span style="text-transform:capitalize">' + esc(d.chamber) + '</span></div>';
+
+  if (d.committees && d.committees.length) {
+    html += '<div class="row" style="gap:8px;margin-top:8px;font-size:12px">' +
+      '<span class="muted">Committees:</span>';
+    d.committees.forEach(function (c) {
+      html += '<span class="pill" style="cursor:default;padding:1px 8px">' + esc(c) + '</span>';
+    });
+    html += '</div>';
+  }
+  html += '</header>';
+
+  html += '<section class="tiles">' +
+    tile('Est. portfolio', usdCompact(d.portfolioValue),
+      usdCompact(d.portfolioValueMin) + '–' + usdCompact(d.portfolioValueMax)) +
+    tile('Trades', String(d.tradeCount), d.uniqueAssets + ' assets') +
+    tile('Bought', usdCompact(d.buyValue), null, { dir: 'up', text: String(d.purchaseCount) }) +
+    tile('Sold', usdCompact(d.sellValue), null, { dir: 'down', text: String(d.saleCount) }) +
+    tile('Avg filing lag', d.avgFilingDelayDays + 'd', '45-day limit') +
+    tile('Last trade', d.lastTradeDate || '—',
+      d.lastTradeDate ? relativeTime(d.lastTradeDate + 'T12:00:00Z') : null) +
+    '</section>';
+
+  html += '<div class="grid2 detail">';
+
+  // Estimated positions, one shared scale anchored to a common baseline.
+  html += '<section class="panel"><h2>Estimated positions</h2>' +
+    '<p class="sub" style="margin-bottom:12px">Net disclosed flow per asset ' +
+    '(purchases minus sales)</p>';
+
+  var holdings = d.holdings || [];
+  if (!holdings.length) {
+    html += '<p class="muted">No positions in this window.</p>';
+  } else {
+    var hmax = Math.max.apply(null, holdings.map(function (h) {
+      return Math.abs(h.netValue); }).concat([1]));
+    holdings.slice(0, 20).forEach(function (h) {
+      var pos = h.netValue >= 0;
+      // A net below the smallest reportable bracket ($1,001) is rounding noise
+      // from midpoint arithmetic, not a position — say so rather than showing
+      // a bogus "$1" holding.
+      var closed = Math.abs(h.netValue) < 1001 && h.tradeCount > 1;
+      html += '<div style="margin-bottom:10px"><div class="spread">' +
+        '<span class="link truncate" title="' + esc(h.assetName) + '" ' +
+        'onclick="navigate(\'asset\',\'' + esc(assetIdOf(h)) + '\')">' +
+        esc(h.ticker || h.assetName) + '</span>' +
+        '<span class="tnum" style="color:' + (closed ? 'var(--text-muted)' :
+          (pos ? 'var(--buy-text)' : 'var(--sell-text)')) + '"' +
+        (closed ? ' title="Disclosed purchases and sales offset — no net position in this window"' : '') +
+        '>' + (closed ? '≈ closed out' : (pos ? '' : '−') + usdCompact(Math.abs(h.netValue))) +
+        '</span></div>' +
+        bar(closed ? 0 : Math.max(1.5, (Math.abs(h.netValue) / hmax) * 100),
+            pos ? 'var(--buy-mark)' : 'var(--sell-mark)') +
+        '<div class="sub">' + esc(ASSET_CLASS_LABEL[h.assetClass] || h.assetClass) + ' · ' +
+        h.tradeCount + ' trade' + (h.tradeCount === 1 ? '' : 's') + ' · last ' +
+        esc(h.lastTradeDate) + '</div></div>';
+    });
+  }
+
+  var mix = d.assetClassMix || [];
+  if (mix.length) {
+    var cmax = Math.max.apply(null, mix.map(function (c) { return c.value; }).concat([1]));
+    html += '<h3>Asset-class mix</h3>';
+    mix.forEach(function (c) {
+      html += '<div style="margin-bottom:6px;font-size:12px"><div class="spread">' +
+        '<span class="secondary">' + esc(ASSET_CLASS_LABEL[c.assetClass] || c.assetClass) + '</span>' +
+        '<span class="tnum">' + usdCompact(c.value) + '</span></div>' +
+        bar(Math.max(1.5, (c.value / cmax) * 100), 'var(--series1)', true) + '</div>';
+    });
+  }
+  html += '</section>';
+
+  html += '<section class="panel"><h2>Disclosed transactions (' + (d.trades || []).length + ')</h2>' +
+    '<div class="scroll" style="margin-top:12px"><table><thead><tr><th>Date</th><th>Asset</th>' +
+    '<th>Action</th><th class="right">Amount</th><th class="right">Lag</th></tr></thead><tbody>';
+
+  (d.trades || []).forEach(function (t) {
+    var buy = isBuy(t);
+    html += '<tr><td class="tnum nowrap secondary">' + esc(t.transactionDate) + '</td>' +
+      '<td><span class="link" onclick="navigate(\'asset\',\'' + esc(assetIdOf(t)) + '\')">' +
+      esc(t.ticker || ASSET_CLASS_LABEL[t.assetClass]) + '</span>' +
+      '<div class="sub truncate" title="' + esc(t.assetName) + '">' + esc(t.assetName) + '</div></td>' +
+      '<td class="nowrap" style="color:' + (buy ? 'var(--buy-text)' : 'var(--sell-text)') + '">' +
+      (buy ? '▲' : '▼') + ' ' + esc(TRADE_TYPE_LABEL[t.type]) +
+      (t.owner !== 'unknown' ? '<div class="sub">' + esc(OWNER_LABEL[t.owner]) + '</div>' : '') +
+      '</td>' +
+      '<td class="right tnum nowrap">' + esc(t.amountRange) + '</td>' +
+      '<td class="right tnum nowrap" style="color:' +
+      (t.filingDelayDays > 45 ? 'var(--sell-text)' : 'var(--text-muted)') + '">' +
+      t.filingDelayDays + 'd' +
+      (t.filingUrl ? ' <a href="' + esc(t.filingUrl) + '" target="_blank" ' +
+        'rel="noreferrer noopener" style="color:var(--series1)">↗</a>' : '') +
+      '</td></tr>';
+  });
+  html += '</tbody></table></div></section></div>';
+
+  html += '<footer><p>Amounts are reported as ranges, so <strong>' +
+    usdCompact(d.portfolioValue) + '</strong> is a midpoint-derived estimate (plausible span ' +
+    usdCompact(d.portfolioValueMin) + '–' + usdCompact(d.portfolioValueMax) + '), not a reported ' +
+    'figure. Positions reflect only what has been disclosed in this window — assets held without ' +
+    'a reported transaction do not appear.</p></footer>';
+  return html;
+}
+
+/* ----------------------------------------------------------- asset view */
+
+function renderAsset(d) {
+  var html = '<span class="backlink" onclick="navigate(\'dashboard\')">← Back to dashboard</span>';
+  html += '<header><div class="row" style="align-items:baseline">' +
+    '<h1>' + esc(d.ticker || d.name) + '</h1>' +
+    '<span class="pill" style="cursor:default">' +
+    esc(ASSET_CLASS_LABEL[d.assetClass] || d.assetClass) + '</span>';
+
+  if (d.quote) {
+    var up = d.quote.changePct >= 0;
+    html += '<span class="row" style="gap:8px;align-items:baseline">' +
+      '<strong class="tnum" style="font-size:20px">$' + d.quote.price.toFixed(2) + '</strong>' +
+      '<span class="tnum" style="color:' + (up ? 'var(--buy-text)' : 'var(--sell-text)') + '">' +
+      (up ? '▲' : '▼') + ' ' + Math.abs(d.quote.changePct).toFixed(2) + '%</span>' +
+      '<span class="sub">as of ' + esc(d.quote.asOf) + '</span></span>';
+  }
+  html += '</div>';
+  if (d.ticker) html += '<p class="secondary" style="margin-top:4px">' + esc(d.name) + '</p>';
+  html += '</header>';
+
+  if (d.history && d.history.length > 1) {
+    html += '<section class="tiles five">';
+    (d.performance || []).forEach(function (p) {
+      html += tile(p.label,
+        p.changePct === null ? 'n/a' : (p.changePct >= 0 ? '+' : '') + p.changePct.toFixed(1) + '%',
+        p.changePct === null ? 'not enough history' : null);
+    });
+    html += '</section>';
+  }
+
+  if (d.ticker && d.history && d.history.length > 1) {
+    html += '<section class="panel"><h2>Price history &amp; disclosed political trades</h2>' +
+      '<p class="sub" style="margin-bottom:12px">Markers sit on the close for the transaction ' +
+      'date. Hover for detail.</p>' + renderChart(d.history, d.trades || []) + '</section>';
+  } else if (d.ticker) {
+    html += '<section class="panel muted">No price history available for this ticker. ' +
+      'This dashboard shows no synthetic prices, so the chart is omitted rather than ' +
+      'filled with invented data.</section>';
+  } else {
+    html += '<section class="panel muted">This asset has no ticker in the disclosure record — ' +
+      'municipal bonds, mutual funds and private holdings have no public market price, so there ' +
+      'is no performance history to chart.</section>';
+  }
+
+  var pos = d.netValue >= 0;
+  html += '<section class="tiles">' +
+    tile('Disclosed buys', usdCompact(d.buyValue), d.purchaseCount + ' trades') +
+    tile('Disclosed sells', usdCompact(d.sellValue), d.saleCount + ' trades') +
+    tile('Net flow', usdCompact(Math.abs(d.netValue)), null,
+      { dir: pos ? 'up' : 'down', text: pos ? 'accumulating' : 'distributing' }) +
+    tile('Filers', String(d.politicianCount), d.buyerCount + ' buyers') +
+    tile('Party mix', d.partySplit.D + 'D · ' + d.partySplit.R + 'R' +
+      (d.partySplit.I ? ' · ' + d.partySplit.I + 'I' : '')) +
+    tile('Last trade', d.lastTradeDate) +
+    '</section>';
+
+  html += '<section class="panel"><h2>Politicians who traded ' +
+    esc(d.ticker || 'this asset') + ' (' + (d.traders || []).length + ')</h2>' +
+    '<div class="scroll" style="margin-top:12px"><table><thead><tr><th>Filer</th><th>Tier</th>' +
+    '<th class="right">Bought</th><th class="right">Sold</th><th class="right">Trades</th>' +
+    '<th>First buy</th><th class="right">Since 1st buy</th></tr></thead><tbody>';
+
+  (d.traders || []).forEach(function (t) {
+    var retColor = t.returnSinceFirstBuyPct === null ? 'var(--text-muted)'
+      : (t.returnSinceFirstBuyPct >= 0 ? 'var(--buy-text)' : 'var(--sell-text)');
+    html += '<tr><td><span class="link" onclick="navigate(\'politician\',\'' +
+      esc(t.politicianId) + '\')"><strong>' + esc(t.politicianName) + '</strong></span>' +
+      '<div class="row sub" style="gap:6px">' + partyMark(t.party) +
+      '<span class="muted">' + esc(t.state) + ' · ' + esc(t.chamber) + '</span></div></td>' +
+      '<td>' + tierBadge(t.tier, true) + '</td>' +
+      '<td class="right tnum" style="color:var(--buy-text)">' +
+      (t.buyValue > 0 ? usdCompact(t.buyValue) : '—') + '</td>' +
+      '<td class="right tnum" style="color:var(--sell-text)">' +
+      (t.sellValue > 0 ? usdCompact(t.sellValue) : '—') + '</td>' +
+      '<td class="right tnum secondary">' + t.tradeCount + '</td>' +
+      '<td class="tnum secondary">' + esc(t.firstTradeDate) + '</td>' +
+      '<td class="right tnum" style="color:' + retColor + '" title="Price change since their ' +
+      'first disclosed purchase. Illustrative only — brackets hide real position size and cost ' +
+      'basis.">' + (t.returnSinceFirstBuyPct === null ? 'n/a'
+        : (t.returnSinceFirstBuyPct >= 0 ? '+' : '') + t.returnSinceFirstBuyPct.toFixed(1) + '%') +
+      '</td></tr>';
+  });
+  html += '</tbody></table></div></section>';
+
+  html += '<section class="panel"><h2>All disclosed transactions (' + (d.trades || []).length +
+    ')</h2><div class="scroll" style="margin-top:12px"><table><thead><tr><th>Date</th>' +
+    '<th>Filer</th><th>Action</th><th class="right">Reported range</th>' +
+    '<th class="right">Lag</th></tr></thead><tbody>';
+  (d.trades || []).forEach(function (t) {
+    var buy = isBuy(t);
+    html += '<tr><td class="tnum nowrap secondary">' + esc(t.transactionDate) + '</td>' +
+      '<td><span class="link" onclick="navigate(\'politician\',\'' + esc(t.politicianId) +
+      '\')">' + esc(t.politicianName) + '</span>' +
+      (t.owner !== 'unknown' && t.owner !== 'self'
+        ? ' <span class="sub">(' + esc(OWNER_LABEL[t.owner]) + ')</span>' : '') + '</td>' +
+      '<td class="nowrap" style="color:' + (buy ? 'var(--buy-text)' : 'var(--sell-text)') + '">' +
+      (buy ? '▲' : '▼') + ' ' + esc(TRADE_TYPE_LABEL[t.type]) + '</td>' +
+      '<td class="right tnum nowrap">' + esc(t.amountRange) + '</td>' +
+      '<td class="right tnum nowrap" style="color:' +
+      (t.filingDelayDays > 45 ? 'var(--sell-text)' : 'var(--text-muted)') + '">' +
+      t.filingDelayDays + 'd</td></tr>';
+  });
+  html += '</tbody></table></div></section>';
+
+  html += '<footer><p>Transaction values are reported as ranges, so totals here are midpoint ' +
+    'estimates. “Since 1st buy” compares the latest close to the close on the filer’s first ' +
+    'disclosed purchase date — it is <strong>not</strong> a return figure: the actual position ' +
+    'size, cost basis and any undisclosed activity are unknown. A disclosed trade is not ' +
+    'evidence of wrongdoing.</p></footer>';
+  return html;
+}
+
+/* ---------------------------------------------------------------- chart */
+
+var CHART = { w: 860, h: 300, padTop: 16, padRight: 16, padBottom: 28, padLeft: 52 };
+var chartData = null;
+
+/**
+ * Price line with disclosed transactions marked on the timeline.
+ *
+ * Three marks, so a legend is present: the close line plus purchase and sale
+ * markers. Markers carry a 2px surface ring because they overlap the line and
+ * each other. One y-axis only — markers sit on the price scale at the close for
+ * their date, never on a second scale of transaction size.
+ */
+function renderChart(history, trades) {
+  var plotW = CHART.w - CHART.padLeft - CHART.padRight;
+  var plotH = CHART.h - CHART.padTop - CHART.padBottom;
+
+  var closes = history.map(function (p) { return p.close; });
+  var lo = Math.min.apply(null, closes);
+  var hi = Math.max.apply(null, closes);
+  var span = (hi - lo) || hi || 1;
+  var dmin = Math.max(0, lo - span * 0.06);
+  var dmax = hi + span * 0.06;
+
+  var xOf = function (i) {
+    return CHART.padLeft + (history.length <= 1 ? plotW / 2 : (i / (history.length - 1)) * plotW);
+  };
+  var yOf = function (v) {
+    return CHART.padTop + plotH - ((v - dmin) / ((dmax - dmin) || 1)) * plotH;
+  };
+
+  // Group same-date, same-direction trades into one marker so dense weeks stay
+  // legible, and snap a trade landing on a non-trading day forward.
+  var indexByDate = {};
+  for (var i = 0; i < history.length; i++) indexByDate[history[i].date] = i;
+
+  var groups = {};
+  trades.forEach(function (t) {
+    var idx = indexByDate[t.transactionDate];
+    if (idx === undefined) {
+      for (var k = 0; k < history.length; k++) {
+        if (history[k].date >= t.transactionDate) { idx = k; break; }
+      }
+    }
+    if (idx === undefined) return;
+    var buy = isBuy(t);
+    var key = idx + ':' + buy;
+    if (!groups[key]) groups[key] = { idx: idx, buy: buy, date: history[idx].date, trades: [] };
+    groups[key].trades.push(t);
+  });
+
+  var markers = [];
+  for (var g in groups) if (groups.hasOwnProperty(g)) markers.push(groups[g]);
+
+  var points = history.map(function (p, i) {
+    return xOf(i).toFixed(1) + ',' + yOf(p.close).toFixed(1);
+  }).join(' ');
+
+  var svg = '<div class="legend">' +
+    '<span><span class="line" style="background:var(--series1)"></span> Close</span>' +
+    '<span><span class="dot" style="display:inline-block;background:var(--buy-mark)"></span> ' +
+    'Disclosed purchase</span>' +
+    '<span><span class="dot" style="display:inline-block;background:var(--sell-mark)"></span> ' +
+    'Disclosed sale</span></div>';
+
+  svg += '<div class="chartwrap" id="chartwrap"><svg viewBox="0 0 ' + CHART.w + ' ' + CHART.h +
+    '" role="img" aria-label="Price history with disclosed political transactions marked" ' +
+    'onmousemove="chartMove(event)" onmouseleave="chartLeave()">';
+
+  // Recessive gridlines + y labels
+  for (var g2 = 0; g2 <= 4; g2++) {
+    var v = dmin + ((dmax - dmin) * g2) / 4;
+    svg += '<line x1="' + CHART.padLeft + '" x2="' + (CHART.w - CHART.padRight) +
+      '" y1="' + yOf(v).toFixed(1) + '" y2="' + yOf(v).toFixed(1) +
+      '" stroke="#1e293b" stroke-width="1"/>' +
+      '<text x="' + (CHART.padLeft - 8) + '" y="' + (yOf(v) + 4).toFixed(1) +
+      '" text-anchor="end" font-size="11" fill="#7c8798">' + usdCompact(v) + '</text>';
+  }
+
+  // X labels; first and last anchor inward so they aren't clipped by the frame.
+  var ticks = Math.min(6, history.length);
+  for (var x = 0; x < ticks; x++) {
+    var idx2 = Math.round((x / ((ticks - 1) || 1)) * (history.length - 1));
+    var anchor = x === 0 ? 'start' : (x === ticks - 1 ? 'end' : 'middle');
+    svg += '<text x="' + xOf(idx2).toFixed(1) + '" y="' + (CHART.h - 8) + '" text-anchor="' +
+      anchor + '" font-size="11" fill="#7c8798">' + esc(history[idx2].date.slice(0, 7)) + '</text>';
+  }
+
+  svg += '<line x1="' + CHART.padLeft + '" x2="' + (CHART.w - CHART.padRight) + '" y1="' +
+    (CHART.padTop + plotH) + '" y2="' + (CHART.padTop + plotH) +
+    '" stroke="#2c3a4f" stroke-width="1"/>';
+
+  svg += '<polyline points="' + points + '" fill="none" stroke="#3987e5" stroke-width="2" ' +
+    'stroke-linejoin="round" stroke-linecap="round"/>';
+
+  svg += '<g id="crosshair" style="display:none">' +
+    '<line id="crossline" y1="' + CHART.padTop + '" y2="' + (CHART.padTop + plotH) +
+    '" stroke="#7c8798" stroke-width="1" stroke-dasharray="3 3"/>' +
+    '<circle id="crossdot" r="5" fill="#3987e5" stroke="#0b1220" stroke-width="2"/></g>';
+
+  markers.forEach(function (m) {
+    svg += '<circle cx="' + xOf(m.idx).toFixed(1) + '" cy="' +
+      yOf(history[m.idx].close).toFixed(1) + '" r="' + (m.trades.length > 1 ? 6 : 4.5) +
+      '" fill="' + (m.buy ? '#0ca30c' : '#d03b3b') + '" stroke="#0b1220" stroke-width="2"/>';
+  });
+
+  svg += '</svg><div class="tooltip" id="charttip" style="display:none"></div></div>';
+
+  chartData = { history: history, markers: markers, dmin: dmin, dmax: dmax, plotW: plotW, plotH: plotH };
+  return svg;
+}
+
+function chartMove(event) {
+  if (!chartData) return;
+  var svg = event.currentTarget;
+  var rect = svg.getBoundingClientRect();
+  var xInView = ((event.clientX - rect.left) / rect.width) * CHART.w;
+  var ratio = (xInView - CHART.padLeft) / chartData.plotW;
+  var idx = Math.round(ratio * (chartData.history.length - 1));
+  idx = Math.max(0, Math.min(chartData.history.length - 1, idx));
+
+  var point = chartData.history[idx];
+  var x = CHART.padLeft + (idx / (chartData.history.length - 1)) * chartData.plotW;
+  var y = CHART.padTop + chartData.plotH -
+    ((point.close - chartData.dmin) / ((chartData.dmax - chartData.dmin) || 1)) * chartData.plotH;
+
+  var group = document.getElementById('crosshair');
+  group.style.display = '';
+  var line = document.getElementById('crossline');
+  line.setAttribute('x1', x); line.setAttribute('x2', x);
+  var dot = document.getElementById('crossdot');
+  dot.setAttribute('cx', x); dot.setAttribute('cy', y);
+
+  var hits = chartData.markers.filter(function (m) { return m.idx === idx; });
+  var html = '<div class="muted tnum">' + esc(point.date) + '</div>' +
+    '<div class="tnum" style="font-size:14px;font-weight:600;margin-top:2px">$' +
+    point.close.toFixed(2) + '</div>';
+  hits.forEach(function (m) {
+    var names = m.trades.slice(0, 3).map(function (t) { return t.politicianName; }).join(', ');
+    html += '<div style="margin-top:6px;padding-top:6px;border-top:1px solid var(--border)">' +
+      '<span style="color:' + (m.buy ? 'var(--buy-text)' : 'var(--sell-text)') + '">' +
+      (m.buy ? '▲ Purchase' : '▼ Sale') + ' ×' + m.trades.length + '</span>' +
+      '<div class="muted truncate">' + esc(names) +
+      (m.trades.length > 3 ? ' +' + (m.trades.length - 3) : '') + '</div></div>';
+  });
+
+  var tip = document.getElementById('charttip');
+  tip.innerHTML = html;
+  tip.style.display = '';
+  var pct = (x / CHART.w) * 100;
+  tip.style.left = 'calc(' + pct + '% ' + (x > CHART.w / 2 ? '- 11rem' : '+ 0.5rem') + ')';
+}
+
+function chartLeave() {
+  var group = document.getElementById('crosshair');
+  if (group) group.style.display = 'none';
+  var tip = document.getElementById('charttip');
+  if (tip) tip.style.display = 'none';
+}
+
+/* ---------------------------------------------------------------- render */
+
+function render() {
+  var root = document.getElementById('app');
+  var html = '<main class="wrap stack">';
+
+  if (state.view === 'dashboard') {
+    if (!state.snapshot) {
+      html += state.error
+        ? '<p class="notice bad">' + esc(state.error) + '</p>'
+        : '<p class="muted">Loading disclosures…</p>';
+    } else {
+      html += renderDashboard();
+    }
+  } else {
+    if (state.loadingDetail) {
+      html += '<span class="backlink" onclick="navigate(\'dashboard\')">← Back to dashboard</span>' +
+        '<p class="muted">Loading…</p>';
+    } else if (state.error) {
+      html += '<span class="backlink" onclick="navigate(\'dashboard\')">← Back to dashboard</span>' +
+        '<p class="notice bad">' + esc(state.error) + '</p>';
+    } else if (state.detail) {
+      html += state.view === 'politician' ? renderPolitician(state.detail) : renderAsset(state.detail);
+    }
+  }
+
+  root.innerHTML = html + '</main>';
+}
+
+/* ------------------------------------------------------------------ boot */
+
+loadSnapshot().then(function () {
+  if (state.view !== 'dashboard' && state.id) navigate(state.view, state.id);
+});
+
+// Keep the dashboard current. Detail views hold still while you read them;
+// they refresh when you navigate back.
+setInterval(function () {
+  if (state.view === 'dashboard') loadSnapshot();
+}, POLL_MS);
+</script>

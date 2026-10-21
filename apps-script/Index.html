@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <base target="_top">
+    <meta charset="utf-8">
+    <?!= include('Styles'); ?>
+  </head>
+  <body>
+    <div id="app">
+      <main class="wrap">
+        <p class="muted" style="padding:2rem 0">Loading disclosures…</p>
+      </main>
+    </div>
+
+    <script>
+      // Values injected server-side by doGet, so a deep link opens the right view.
+      var INITIAL_VIEW = '<?= initialView ?>' || 'dashboard';
+      var INITIAL_ID   = '<?= initialId ?>';
+      var POLL_MS      = <?= pollMs ?>;
+    </script>
+    <?!= include('App'); ?>
+  </body>
+</html>
